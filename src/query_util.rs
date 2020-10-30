@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 
-use chrono::{Utc,prelude::*};
+use chrono::{prelude::*, Utc};
 
 pub enum QueryRequestType {
     Popular {
@@ -19,17 +19,21 @@ pub enum QueryRequestType {
 }
 
 impl QueryRequestType {
-    ///parses request from from http path 
+    ///parses request from from http path
     pub fn from_path(path: &String) -> Option<Self> {
         let ps = path.as_str();
         let tokens: Vec<_> = ps.split('/').rev().take(2).collect();
         let query = tokens[0];
         let query_type = tokens[1];
-        
+
         Self::parse_query(query)
-            .map(|(lbound,ubound,length)| match query_type {
-                "count" => Some(Self::Count{lbound,ubound}),
-                "popular" =>Some(Self::Popular{lbound,ubound,length:length as i32}),
+            .map(|(lbound, ubound, length)| match query_type {
+                "count" => Some(Self::Count { lbound, ubound }),
+                "popular" => Some(Self::Popular {
+                    lbound,
+                    ubound,
+                    length: length as i32,
+                }),
                 _ => None,
             })
             .flatten()
@@ -108,7 +112,8 @@ impl QueryRequestType {
 
         let offset_in_seconds = match offset_table {
             1 => 365 * 24 * 3600, //y
-            2 => {//m
+            2 => {
+                //m
                 let y = date_lower[0][0] as i32;
                 let m = date_lower[0][1];
                 let upper = if m == 12 {
@@ -119,11 +124,10 @@ impl QueryRequestType {
                 let lower = Utc.ymd(y, m, 1);
                 upper.signed_duration_since(lower).num_seconds()
             }
-            3 => 24 * 3600,//d
-            4 => 3600,//h
-            5 => 60,//m
-            _ => 1, //s
-
+            3 => 24 * 3600, //d
+            4 => 3600,      //h
+            5 => 60,        //m
+            _ => 1,         //s
         };
         let upper_date_time: DateTime<Utc> =
             lower_date_time + chrono::Duration::seconds(offset_in_seconds);
@@ -140,12 +144,9 @@ impl QueryRequestType {
     }
 }
 
-
-
-
 pub struct QueryResults {
-    url_table: HashMap<String, u64>,
-    top_results: Vec<(String, u64)>,
+    url_table: HashMap<u64, u64>,
+    top_results: Vec<(u64, u64)>,
     pub max_results: u32,
 }
 
@@ -163,22 +164,24 @@ impl QueryResults {
         self.top_results.clear();
     }
 
-    pub fn get_distinct(&self)->u64{
+    pub fn get_distinct(&self) -> u64 {
         self.url_table.len() as u64
     }
 
     /// should be called for each chunk read
-    pub fn add_url_to_stats(&mut self, url: String) {
+    pub fn add_url_to_stats(&mut self, url_id: u64) {
         //returns updated hits
-        if let Some(hits) = self.url_table.get_mut(&url) {
+        if let Some(hits) = self.url_table.get_mut(&url_id) {
             *hits += 1;
         } else {
-            self.url_table.insert(url.clone(), 1);
+            self.url_table.insert(url_id, 1);
         }
     }
 
-    pub fn as_list(&mut self) -> &[(String, u64)] {
-        
+    pub fn as_list_cb<Callback>(&mut self, id_to_string: &HashMap<u64, String>, mut cb: Callback )
+    where
+        Callback: FnMut(usize,usize,&str, u64),
+    {
         for (url, hits) in self.url_table.iter() {
             self.top_results.push((url.clone(), *hits));
             self.top_results.sort_by(|(_, a), (_, b)| b.cmp(a));
@@ -186,13 +189,27 @@ impl QueryResults {
                 self.top_results.pop();
             }
         }
-        let max_results  = (self.max_results as usize).min(self.top_results.len());
-        &self.top_results[0..max_results]
+        let max_results = (self.max_results as usize).min(self.top_results.len());
+
+        self.top_results[0..max_results]
+            .iter()
+            .enumerate()
+            .map(move |(k,(url_id, hits))| {
+                (   k,
+                    id_to_string
+                        .get(url_id)
+                        .map(|url| url.as_str())
+                        .unwrap_or("ERROR"),
+                    hits,
+                )
+            }).for_each(|(index,url,&id)|{
+                cb(index,max_results,url,id)
+            });
+
     }
 }
 
 pub struct QueryExecutor {
-    num_chunks: u64,
     chunk_ranges: Vec<(String, [i64; 2])>,
     cached_chunks: LruCache<String, TimestampChunk>,
 }
@@ -206,32 +223,22 @@ impl QueryExecutor {
             .collect();
 
         Self {
-            num_chunks,
             chunk_ranges,
             //attempt to cache 60 percent of chunks at any given time
             cached_chunks: LruCache::new((num_chunks as usize * 6) / 10),
         }
     }
-    
+
     /// This function collects data for a both queires at once
     ///`lbound` is inclusive time in seconds
     ///`ubound` is exclusive time in seconds
-    pub fn scan_database(
-        &mut self,
-        lbound: i64,
-        ubound: i64,
-        results: &mut QueryResults,
-        id_to_url_table: &HashMap<u64, String>,
-    ) {
-        self.iterate_over_chunks(lbound, ubound, |ts|{
+    pub fn scan_database(&mut self, lbound: i64, ubound: i64, results: &mut QueryResults) {
+        self.iterate_over_chunks(lbound, ubound, |ts| {
             //url_id is the unique key needed to lookup the url string
             let url_id = ts.url_id;
-            let url = id_to_url_table.get(&url_id).unwrap();
-            results.add_url_to_stats(url.clone());
+            results.add_url_to_stats(url_id);
         });
     }
-
-
 
     /// A helper function that attempts to efficiently iterate over appropriate chunks given a range.\
     /// This function uses an LRU cache to keep as many chunks in main memory as possible to avoid\
@@ -259,7 +266,7 @@ impl QueryExecutor {
                         let file = std::fs::read(path).expect("chunk not found");
                         let chunk: TimestampChunk =
                             bincode::deserialize(&file[..]).expect("deserialize failed");
-                        //because chunk isnt in cache it is inserted 
+                        //because chunk isnt in cache it is inserted
                         cached_chunks.put(path.clone(), chunk);
                         //return a reference to chunk owned by LRU
                         cached_chunks.get(path).unwrap()
@@ -281,7 +288,7 @@ impl QueryExecutor {
                 //walk forward until out of range
                 for index in start_index..chunk.timestamp_list.len() {
                     let ts = &chunk.timestamp_list[index];
-                    if  ts.timestamp < lbound || ts.timestamp >= ubound {
+                    if ts.timestamp < lbound || ts.timestamp >= ubound {
                         break;
                     }
                     cb(ts);
@@ -289,7 +296,7 @@ impl QueryExecutor {
                 //walk backward until out of range
                 for index in (0..start_index).rev() {
                     let ts = &chunk.timestamp_list[index];
-                    if  ts.timestamp < lbound || ts.timestamp >= ubound {
+                    if ts.timestamp < lbound || ts.timestamp >= ubound {
                         break;
                     }
                     cb(ts);
@@ -301,7 +308,6 @@ impl QueryExecutor {
         );
     }
 }
-
 
 //upper boundss are exclusive
 //lower bounds are inclusive

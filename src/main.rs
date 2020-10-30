@@ -38,21 +38,21 @@ fn main() {
     start_primitive_web_server(move |path, message| {
         let query_pointer = (&pointer_clone).clone();
         let path = path.replace("%20", " ");
-  
+
         match QueryRequestType::from_path(&path) {
             Some(QueryRequestType::Count { lbound, ubound }) => {
                 let lock = query_pointer.lock().unwrap();
-                let (id_table, executor, results) = &mut *lock.borrow_mut();
+                let (_, executor, results) = &mut *lock.borrow_mut();
                 results.clear();
                 results.max_results = 1;
                 let t0 = Instant::now();
-                executor.scan_database(lbound, ubound, results, id_table);
+                executor.scan_database(lbound, ubound, results);
                 let distinct = results.get_distinct();
                 let dt = t0.elapsed().as_millis();
-                
+
                 message.push_str(format!("{{ count: {} }}\n", distinct).as_str());
 
-                println!("{}",format!("query took {} ms...\n", dt).as_str());
+                println!("{}", format!("query took {} ms...\n", dt).as_str());
             }
             Some(QueryRequestType::Popular {
                 lbound,
@@ -64,21 +64,25 @@ fn main() {
                 results.clear();
                 results.max_results = length as u32;
                 let t0 = Instant::now();
-                executor.scan_database(lbound, ubound, results, id_table);
-                let top_results = results.as_list();
-                let dt = t0.elapsed().as_millis();
-                
+                executor.scan_database(lbound, ubound, results);
                 message.push_str("{\n\t \"queries\": [\n");
-                let len = top_results.len();
-                for (url, hits) in &top_results[0..len-1] {
-                    message.push_str(format!("\t   {{ \"query\": \"{}\",\"count\":\"{}\"}},\n", url, hits).as_str());
-                }
-                if let Some((url,hits)) = top_results.last(){
-                    message.push_str(format!("\t   {{ \"query\": \"{}\",\"count\":\"{}\"}}\n", url, hits).as_str());
-                }   
+                results.as_list_cb(id_table, |k, len, url, hits| {
+                    if k != len - 1 {
+                        message.push_str(
+                            format!("\t   {{ \"query\": \"{}\",\"count\":\"{}\"}},\n", url, hits)
+                                .as_str(),
+                        );
+                    } else {
+                        message.push_str(
+                            format!("\t   {{ \"query\": \"{}\",\"count\":\"{}\"}}\n", url, hits)
+                                .as_str(),
+                        );
+                    }
+                });
                 message.push_str("\t]\n}\n");
+                let dt = t0.elapsed().as_millis();
 
-                println!("{}",format!("query took {} ms...\n", dt).as_str());
+                println!("{}", format!("query took {} ms...\n", dt).as_str());
             }
             _ => (),
         }
@@ -113,11 +117,11 @@ where
                     let mut request = httparse::Request::new(&mut headers[..]);
                     let mut path = String::new();
                     if let Ok(_) = request.parse(&http_request_bytes[..]) {
-                        let rpath = request.path.unwrap();
+                        let rpath = request.path.unwrap_or("");
                         path = rpath.to_string();
                     };
 
-                    //gather response 
+                    //gather response
                     let mut message = String::new();
                     cb_clone(path, &mut message);
 
